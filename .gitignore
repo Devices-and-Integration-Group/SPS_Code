@@ -1,0 +1,10 @@
+__pycache__/
+.pytest_cache/
+.venv/
+data/*.npz
+*.pt
+*.pth
+*.log
+*.png
+*.svg
+paper_*.csv
