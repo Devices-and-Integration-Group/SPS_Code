@@ -68,7 +68,7 @@ Use `python run_ablation.py --dataset data/octmnist.npz --dry-run` to check inpu
 python reproduce_fig5_revised.py --dataset data/octmnist.npz --results-dir results/ablation --output-dir results/figure5_revised
 ```
 
-Use an empty figure output directory. `RELEASE_CHECKLIST.md` lists the release files.
+Use an empty figure output directory.
 
 ## Completed five-seed test results
 

@@ -10,5 +10,7 @@ data/*.npz
 paper_*.csv
 results/
 input_pulse_raster/
+README_zh-CN.md
+RELEASE_CHECKLIST.md
 mean_std.csv
 ablation_mean_std.csv
