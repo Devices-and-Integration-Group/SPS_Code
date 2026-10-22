@@ -8,3 +8,7 @@ data/*.npz
 *.png
 *.svg
 paper_*.csv
+results/
+input_pulse_raster/
+mean_std.csv
+ablation_mean_std.csv

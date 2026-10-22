@@ -1,7 +1,7 @@
 """
 main.py
 =======
-Device-range-constrained, measured-state-quantized deep convolutional SNN for 28x28 OCTMNIST.
+Shared 70-epoch continuous-weight baseline and reusable OCTMNIST SNN components.
 
 Key corrections in this version
 -------------------------------
@@ -20,8 +20,8 @@ Key corrections in this version
    as two spike-encoded input channels, residual spike-current shortcuts inside equal-width blocks,
    and a bounded monotonic output transform.  The latter leaves argmax unchanged while keeping
    four-class cross-entropy below 10 by construction.
-6) Stage A trains the continuous device-range-constrained SNN.  Stage B performs measured-state
-   QAT.  Model selection uses validation data only; the held-out test is reported once.
+6) This entry point trains only the 70-epoch continuous device-range-constrained baseline.
+   run_ablation.py branches from its final checkpoint for 30 further epochs per condition.
 7) CSV export of epoch metrics, confusion matrices and eight LIF-layer firing rates is retained.
 
 The code targets >=90% validation/test accuracy, but it never uses test labels to manufacture that
@@ -65,7 +65,8 @@ def seed_everything(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
 
 def distributed_context(local_rank_arg: Optional[int] = None):
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -114,29 +115,17 @@ def find_input_file(canonical: str, patterns: list[str]) -> Path:
 def read_device_csv(path: Path) -> tuple[np.ndarray, np.ndarray]:
     raw = np.genfromtxt(path, delimiter=",", names=True, encoding="utf-8-sig")
     names = tuple(raw.dtype.names or ())
-    if "LTP" not in names or "LTD" not in names:
-        raise ValueError(f"{path.name}: columns LTP and LTD are required; got {names}")
+    if not {"Number", "LTP", "LTD"}.issubset(names):
+        raise ValueError(f"{path.name}: columns Number, LTP and LTD are required; got {names}")
+    number = np.atleast_1d(raw["Number"])
     ltp = np.atleast_1d(raw["LTP"]).astype(np.float64)
     ltd = np.atleast_1d(raw["LTD"]).astype(np.float64)
-    ltp = ltp[np.isfinite(ltp)]
-    ltd = ltd[np.isfinite(ltd)]
-    if len(ltp) < 8 or len(ltd) < 8:
-        raise ValueError("Need at least 8 measured states on each LTP/LTD branch")
-
-    n = max(len(ltp), len(ltd))
-    xnew = np.linspace(0.0, 1.0, n)
-    if len(ltp) != n:
-        ltp = np.interp(xnew, np.linspace(0.0, 1.0, len(ltp)), ltp)
-    if len(ltd) != n:
-        ltd = np.interp(xnew, np.linspace(0.0, 1.0, len(ltd)), ltd)
-
-    if ltp[-1] < ltp[0]:
-        ltp = ltp[::-1].copy()
-    if ltd[-1] > ltd[0]:
-        ltd = ltd[::-1].copy()
-
-    if np.any(ltp <= 0) or np.any(ltd <= 0):
-        raise ValueError("All measured conductances must be positive")
+    if len(number) != 80 or not np.array_equal(number, np.arange(1, 81)):
+        raise ValueError("Measured CSV must contain exactly Number=1..80; row 1 is zero-pulse state")
+    if not np.all(np.isfinite(ltp)) or not np.all(np.isfinite(ltd)):
+        raise ValueError("Measured conductance table contains missing/nonfinite states")
+    if np.any(ltp <= 0) or np.any(ltd <= 0) or ltp[-1] <= ltp[0] or ltd[-1] >= ltd[0]:
+        raise ValueError("Invalid positive LTP low-to-high or LTD high-to-low endpoint ordering")
     return ltp, ltd
 
 class DeviceCurve:
@@ -189,6 +178,11 @@ class DeviceCurve:
         self.delta_min = float(diff.min())
         self.delta_max = float(diff.max())
         self.delta_span = max(abs(self.delta_min), abs(self.delta_max))
+        # The ideal LTP and LTD branches are the same 80 uniformly spaced states
+        # traversed in opposite directions. Two such devices have 2*N-1 unique
+        # differential conductances, not 2*(2*N)-1.
+        self.ideal_levels = 2 * self.n_states - 1
+        self.ideal_step = self.g_span / (self.n_states - 1)
 
         print(
             f"[device] {path.name}: {self.n_states} LTP + {self.n_states} LTD measured states; "
@@ -254,6 +248,17 @@ class DifferentialMemristorState(nn.Module):
         _, _, q = self.curve.nearest_pair(self.continuous_dg())
         return q
 
+    def ideal_quantized_dg(self) -> torch.Tensor:
+        dg = self.continuous_dg()
+        # Explicit ideal differential pair: G+ and G- are selected from the
+        # same reversible, uniformly spaced 0..N-1 conductance states.
+        index = torch.round(dg / self.curve.ideal_step).clamp(
+            -(self.curve.n_states - 1), self.curve.n_states - 1
+        )
+        g_p = self.curve.g_min + index.clamp_min(0) * self.curve.ideal_step
+        g_n = self.curve.g_min + (-index).clamp_min(0) * self.curve.ideal_step
+        return g_p - g_n
+
     def programmed_dg(self) -> torch.Tensor:
         return self.g_p - self.g_n
 
@@ -261,6 +266,11 @@ class DifferentialMemristorState(nn.Module):
         dg = self.continuous_dg()
         if self.mode == "continuous":
             eff = dg
+        elif self.mode == "ideal_qat":
+            q = self.ideal_quantized_dg()
+            eff = dg + (q - dg).detach()
+        elif self.mode == "ideal":
+            eff = self.ideal_quantized_dg()
         elif self.mode == "qat":
             q = self.quantized_dg()
             # measured-state forward, continuous-gradient backward
@@ -277,8 +287,8 @@ class DifferentialMemristorState(nn.Module):
 
     @torch.no_grad()
     def set_mode(self, mode: str) -> None:
-        if mode not in {"continuous", "qat", "programmed"}:
-            raise ValueError("mode must be continuous, qat, or programmed")
+        if mode not in {"continuous", "ideal_qat", "ideal", "qat", "programmed"}:
+            raise ValueError("unsupported weight mode")
         self.mode = mode
 
     @torch.no_grad()
@@ -296,9 +306,11 @@ class DifferentialMemristorState(nn.Module):
         self.g_n.copy_(self.curve.state_conductance(n_state))
 
     @torch.no_grad()
-    def mapping_error(self) -> tuple[float, float]:
+    def mapping_error(self, quantizer: str = "measured") -> tuple[float, float]:
+        if quantizer not in {"ideal", "measured"}:
+            raise ValueError(f"unsupported quantizer: {quantizer}")
         target = self.continuous_dg()
-        q = self.quantized_dg()
+        q = self.ideal_quantized_dg() if quantizer == "ideal" else self.quantized_dg()
         err = (q - target).abs() / self.curve.delta_span
         return float(err.mean()), float(err.max())
 
@@ -415,12 +427,20 @@ class OCTDataset(Dataset):
         x = torch.from_numpy(self.images[i].copy()).float().unsqueeze(0) / 255.0
         return x, int(self.labels[i])
 
+def validation_keep_indices(train_images: np.ndarray, val_images: np.ndarray) -> np.ndarray:
+    """Exclude only train-overlapping validation rows; retain internal duplicates."""
+    train_pixels = {image.tobytes() for image in train_images}
+    return np.fromiter(
+        (i for i, image in enumerate(val_images) if image.tobytes() not in train_pixels),
+        dtype=np.int64,
+    )
+
 def load_full_splits(cfg):
     npz = Path(cfg.dataset_path).expanduser() if cfg.dataset_path else SCRIPT_DIR / "data" / "octmnist.npz"
     if not npz.is_file():
         raise FileNotFoundError(f"OCTMNIST archive not found: {npz}")
     expected = {"train": 97477, "val": 10832, "test": 1000}
-    splits = []
+    arrays = {}
     with np.load(npz, allow_pickle=False) as f:
         for split, count in expected.items():
             images = f[f"{split}_images"]
@@ -429,12 +449,30 @@ def load_full_splits(cfg):
                 raise ValueError(f"Unexpected {split} split shapes: {images.shape}, {labels.shape}")
             if not np.isin(labels, np.arange(N_CLASSES)).all():
                 raise ValueError(f"Unexpected labels in {split} split")
-            counts = np.bincount(labels.astype(np.int64), minlength=N_CLASSES)
-            print(f"[data] {split}={count}; classes={counts.tolist()}")
-            splits.append(OCTDataset(images, labels))
-    return tuple(splits)
+            arrays[split] = (images, labels)
 
-class FullSplitBatchSampler(Sampler[list[int]]):
+    train_images, train_labels = arrays["train"]
+    val_images, val_labels = arrays["val"]
+    test_images, test_labels = arrays["test"]
+    keep = validation_keep_indices(train_images, val_images)
+    exclusions_file = SCRIPT_DIR / "data" / "validation_excluded_indices.csv"
+    if exclusions_file.is_file():
+        with exclusions_file.open(newline="", encoding="utf-8-sig") as stream:
+            listed = np.asarray([int(row["official_val_index"])
+                                 for row in csv.DictReader(stream)], dtype=np.int64)
+        computed = np.setdiff1d(np.arange(len(val_images)), keep, assume_unique=True)
+        if not np.array_equal(listed, computed):
+            raise ValueError("Published validation exclusion index file differs from the active filter")
+    print(f"[data] validation: excluded {len(val_images) - len(keep)} exact train-image matches")
+    for split, labels in (("train", train_labels), ("val", val_labels[keep]),
+                          ("test", test_labels)):
+        counts = np.bincount(labels.astype(np.int64), minlength=N_CLASSES)
+        print(f"[data] {split}={len(labels)}; classes={counts.tolist()}")
+    return (OCTDataset(train_images, train_labels),
+            OCTDataset(val_images[keep], val_labels[keep]),
+            OCTDataset(test_images, test_labels))
+
+class FullSplitBatchSampler(Sampler):
     def __init__(self, size: int, batch_size: int, rank: int, world_size: int, seed: int):
         if size < world_size or batch_size < world_size:
             raise ValueError("Dataset and global batch size must be at least WORLD_SIZE")
@@ -620,10 +658,10 @@ class OCTMemristorSNN(nn.Module):
             st.program_from_shadow()
 
     @torch.no_grad()
-    def quantization_stats(self) -> tuple[float, float]:
+    def quantization_stats(self, quantizer: str = "measured") -> tuple[float, float]:
         means, maxes = [], []
         for st in self._mem_states():
-            a, b = st.mapping_error()
+            a, b = st.mapping_error(quantizer)
             means.append(a)
             maxes.append(b)
         return float(np.mean(means)), float(np.max(maxes))
@@ -663,7 +701,7 @@ class Config:
     weight_decay: float = 1.5e-4
     grad_clip: float = 3.0
     label_smoothing: float = 0.035
-    class_weights: tuple[float, float, float, float] = (1.00, 1.03, 1.22, 1.08)
+    class_weights: tuple[float, float, float, float] = (0.69666175, 1.26143235, 1.44769719, 0.59420871)
     spike_reg: float = 2.5e-4
     firing_low: float = 0.035
     firing_high: float = 0.36
@@ -818,7 +856,7 @@ def make_training_history_row(stage: str, weight_mode: str, stage_epoch: int,
     return row
 
 
-def save_training_and_lif_history(history: list[dict]) -> None:
+def save_training_and_lif_history(history: list[dict], output_dir: Path) -> None:
     """Export float/device epoch metrics and LIF firing-rate histories."""
     if not history:
         print("[csv] no training history in this run (for example --eval-only); history CSVs skipped")
@@ -837,18 +875,18 @@ def save_training_and_lif_history(history: list[dict]) -> None:
     # Separate files make the ideal floating-point and mapped-device curves
     # directly usable for plotting, while the combined file preserves chronology.
     write_dict_rows_csv(
-        SCRIPT_DIR / "paper_training_history_all.csv", history, metric_fields + rate_fields
+        output_dir / "paper_training_history_all.csv", history, metric_fields + rate_fields
     )
     float_rows = [r for r in history if r["weight_mode"] == "ideal_float_shadow"]
-    device_rows = [r for r in history if r["weight_mode"] == "mapped_physical_device"]
+    device_rows = [r for r in history if r["weight_mode"] != "ideal_float_shadow"]
     if float_rows:
         write_dict_rows_csv(
-            SCRIPT_DIR / "paper_float_weight_training_history.csv",
+            output_dir / "paper_float_weight_training_history.csv",
             float_rows, metric_fields + rate_fields
         )
     if device_rows:
         write_dict_rows_csv(
-            SCRIPT_DIR / "paper_device_weight_training_history.csv",
+            output_dir / "paper_quantized_weight_training_history.csv",
             device_rows, metric_fields + rate_fields
         )
 
@@ -866,7 +904,7 @@ def save_training_and_lif_history(history: list[dict]) -> None:
                 mean_firing_rate_percent=100.0 * float(r[f"rate_{name}"]),
             ))
     write_dict_rows_csv(
-        SCRIPT_DIR / "paper_lif_firing_rates_by_epoch.csv", lif_epoch_rows,
+        output_dir / "paper_lif_firing_rates_by_epoch.csv", lif_epoch_rows,
         ["stage", "weight_mode", "stage_epoch", "global_epoch", "lif_layer",
          "mean_firing_rate", "mean_firing_rate_percent"]
     )
@@ -894,7 +932,7 @@ def save_training_and_lif_history(history: list[dict]) -> None:
             device_stage_epochs=int(device_values.size),
         ))
     write_dict_rows_csv(
-        SCRIPT_DIR / "paper_lif_firing_rates_full_training.csv", lif_full_rows,
+        output_dir / "paper_lif_firing_rates_full_training.csv", lif_full_rows,
         ["lif_layer",
          "full_training_mean_firing_rate", "full_training_mean_firing_rate_percent",
          "float_stage_mean_firing_rate", "float_stage_mean_firing_rate_percent",
@@ -936,10 +974,10 @@ def save_final_split_metrics_csv(path: Path, split_metrics: list[tuple[str, dict
         fields.extend([f"precision_{name}", f"recall_{name}", f"f1_{name}"])
     write_dict_rows_csv(path, rows, fields)
 
-def train_epoch(model, forward_model, loader, optimizer, cfg, device, qat: bool,
+def train_epoch(model, forward_model, loader, optimizer, cfg, device, weight_mode: str,
                 epoch: int = 0, rank: int = 0, world_size: int = 1):
     forward_model.train()
-    model.set_weight_mode("qat" if qat else "continuous")
+    model.set_weight_mode(weight_mode)
     if world_size > 1:
         loader.batch_sampler.set_epoch(epoch)
     weights = torch.tensor(cfg.class_weights, dtype=torch.float32, device=device)
@@ -986,7 +1024,7 @@ def train_epoch(model, forward_model, loader, optimizer, cfg, device, qat: bool,
 
         if rank == 0 and bi % 100 == 0:
             dt = max(time.time() - t0, 1e-6)
-            mode = "QAT" if qat else "continuous"
+            mode = weight_mode
             print(
                 f"  batch {bi:03d}/{len(loader)} mode={mode} loss={loss_sum/n:.4f} "
                 f"acc={100*correct/n:.2f}% {n/dt:.0f} img/s",
@@ -1156,7 +1194,7 @@ def dt_pilot_sweep(base_cfg: Config, candidates_us=(0.5, 1.0, 2.0, 4.0), pilot_e
         model.set_weight_mode("continuous")
         opt = build_optimizer(model, cfg.warmup_lr, cfg.weight_decay)
         for ep in range(pilot_epochs):
-            train_epoch(model, model, tl, opt, cfg, device, qat=False, epoch=ep)
+            train_epoch(model, model, tl, opt, cfg, device, weight_mode="continuous", epoch=ep)
         val = evaluate(model, vl, device, cfg.steps)
         rows.append((us, beta_from_dt(dt), cfg.steps, val["acc"], val["min_recall"]))
         print(
@@ -1171,8 +1209,12 @@ def dt_pilot_sweep(base_cfg: Config, candidates_us=(0.5, 1.0, 2.0, 4.0), pilot_e
 # Main
 # =============================================================================
 def parse_args():
-    p = argparse.ArgumentParser(description="Measured-state QAT memristor SNN for OCTMNIST-28")
+    p = argparse.ArgumentParser(description="Shared 70-epoch OCTMNIST SNN baseline and 30-epoch ablation continuations")
     p.add_argument("--dataset", type=str, default=None)
+    p.add_argument("--output-dir", type=str, default=None)
+    p.add_argument("--experiment", choices=("baseline", "float", "ideal", "measured"), default="baseline")
+    p.add_argument("--base-checkpoint", type=str, default=None,
+                   help="Required for a 30-epoch ablation branch; must be the epoch-70 LAST checkpoint")
     p.add_argument("--dt-us", type=float, default=1.0)
     p.add_argument("--warmup-epochs", type=int, default=70)
     p.add_argument("--device-epochs", type=int, default=30)
@@ -1181,11 +1223,12 @@ def parse_args():
     p.add_argument("--workers", type=int, default=0)
     p.add_argument("--seed", type=int, default=19)
     p.add_argument("--local-rank", "--local_rank", type=int, default=None)
-    p.add_argument("--checkpoint", type=str, default="paper_measured_qat_best.pt")
+    p.add_argument("--checkpoint", type=str, default="base_epoch_70.pt")
     p.add_argument("--eval-only", action="store_true")
     p.add_argument("--dt-sweep", action="store_true")
     p.add_argument("--pilot-epochs", type=int, default=2)
     p.add_argument("--smoke-test", action="store_true")
+    p.add_argument("--early-stop", action="store_true", help="deprecated; rejected because all branches must run 30 epochs")
     p.add_argument("--report-tta", action="store_true", help="supplementary only; primary result is raw single-pass physical SNN")
     p.add_argument("--no-plots", action="store_true")
     return p.parse_args()
@@ -1204,6 +1247,15 @@ def smoke_test(cfg: Config):
     loss.backward()
     model.project_shadow_weights()
 
+    model.set_weight_mode("ideal_qat")
+    with torch.no_grad():
+        zi_qat = model(x, steps=16)
+    ideal_mean_err, ideal_max_err = model.quantization_stats("ideal")
+    model.set_weight_mode("ideal")
+    with torch.no_grad():
+        zi = model(x, steps=16)
+    ideal_delta = float((zi_qat - zi).abs().max())
+
     model.set_weight_mode("qat")
     with torch.no_grad():
         zq = model(x, steps=16)
@@ -1215,16 +1267,87 @@ def smoke_test(cfg: Config):
         zp = model(x, steps=16)
     delta = float((zq - zp).abs().max())
     assert z.shape == (2, 4) and torch.isfinite(zp).all()
+    assert ideal_delta < 2e-5, f"ideal QAT/inference mismatch: {ideal_delta}"
     assert delta < 2e-5, f"QAT/programmed mismatch: {delta}"
     assert float(loss.detach()) < 10.0
     print(
         f"[smoke] OK; steps=16 beta={model.beta:.9f}; CE={float(loss.detach()):.4f}; "
-        f"mean normalized map error={mean_err:.3e}; max={max_err:.3e}; "
+        f"ideal map error mean/max={ideal_mean_err:.3e}/{ideal_max_err:.3e}; "
+        f"measured map error mean/max={mean_err:.3e}/{max_err:.3e}; "
+        f"max |ideal-QAT/ideal logits|={ideal_delta:.3e}; "
         f"max |QAT-programmed logits|={delta:.3e}; rates={np.round(r.detach().cpu().numpy(),3)}"
     )
 
 
+def report_final_outputs(model, curve, cfg, args, output_dir, checkpoint_path,
+                         train_ds, val_ds, train_loader, val_loader, test_loader,
+                         device, final_weight_mode):
+    """Keep the existing final split, confusion, metadata and optional figure outputs."""
+    model.set_weight_mode(final_weight_mode)
+    val_logits, val_y = collect_logits(model, val_loader, device, cfg.steps, tta_flip=False)
+    val_final = metrics_from_logits(val_logits, val_y, calibration=None)
+    print_metrics(f"VAL-final {args.experiment} 16-step", val_final)
+
+    test_logits, test_y = collect_logits(model, test_loader, device, cfg.steps, tta_flip=False)
+    test_final = metrics_from_logits(test_logits, test_y, calibration=None)
+    print_metrics(f"TEST {args.experiment} 16-step", test_final)
+
+    train_eval_loader = DataLoader(
+        train_ds, batch_size=cfg.eval_batch_size, shuffle=False,
+        num_workers=cfg.workers, pin_memory=torch.cuda.is_available()
+    )
+    train_logits, train_y = collect_logits(model, train_eval_loader, device, cfg.steps, tta_flip=False)
+    train_final = metrics_from_logits(train_logits, train_y, calibration=None)
+    print_metrics(f"TRAIN-final {args.experiment} 16-step", train_final)
+
+    save_confusion_matrix_csv(output_dir / "paper_confusion_matrix_train.csv", train_final)
+    save_confusion_matrix_csv(output_dir / "paper_confusion_matrix_validation.csv", val_final)
+    save_confusion_matrix_csv(output_dir / "paper_confusion_matrix_test.csv", test_final)
+    save_final_split_metrics_csv(
+        output_dir / "paper_final_split_metrics.csv",
+        [("train", train_final), ("validation", val_final), ("test", test_final)]
+    )
+    if args.report_tta:
+        tta = evaluate(model, test_loader, device, cfg.steps, tta_flip=True)
+        print_metrics("TEST supplementary flip-TTA", tta)
+    if args.experiment == "measured":
+        p_ltp, p_ltd = model.pulse_counts()
+        print(f"[device] canonical programming pulse events: LTP={p_ltp:,}, LTD={p_ltd:,}")
+
+    passed = (
+        test_final["acc"] >= cfg.target_acc and
+        test_final["min_recall"] >= cfg.target_min_recall and
+        test_final["loss"] < 10.0
+    )
+    print(
+        f"[target] {args.experiment} accuracy>=90%, every-class recall>=80%, loss<10: "
+        f"{'PASS' if passed else 'NOT REACHED'}"
+    )
+    torch.save(dict(
+        checkpoint=str(checkpoint_path.name), experiment=args.experiment, config=asdict(cfg),
+        test_acc=test_final["acc"], test_loss=test_final["loss"],
+        test_recall=test_final["recall"], test_cm=test_final["cm"], passed=passed,
+        device_g_min=curve.g_min, device_g_max=curve.g_max,
+        differential_delta_min=curve.delta_min, differential_delta_max=curve.delta_max,
+        ideal_uniform_levels=curve.ideal_levels,
+        measured_ordered_pair_states=int(curve.diff_values.numel()),
+    ), output_dir / "paper_final_metadata.pt")
+    if not args.no_plots:
+        plot_device(curve, output_dir / "paper_device_curves.png")
+        identity_calibration = (1.0, torch.zeros(N_CLASSES))
+        plot_receptive_fields(model, val_ds, device, cfg, identity_calibration, output_dir / "new2.png")
+
+
 def run_main(args, rank: int, world_size: int, device: torch.device):
+    if args.experiment == "baseline" and args.base_checkpoint:
+        raise ValueError("The baseline cannot use --base-checkpoint")
+    if args.experiment != "baseline" and not args.base_checkpoint and not (args.smoke_test or args.dt_sweep):
+        raise ValueError("An ablation branch requires --base-checkpoint; run run_ablation.py for the complete workflow")
+    if not (args.smoke_test or args.dt_sweep or args.eval_only):
+        if args.warmup_epochs != 70 or args.device_epochs != 30 or args.extra_device_epochs != 0:
+            raise ValueError("The specified ablation protocol requires exactly 70 baseline + 30 continuation epochs")
+        if args.early_stop:
+            raise ValueError("Early stopping is disabled: all three branches must train for exactly 30 epochs")
     if not torch.cuda.is_available():
         try:
             torch.set_num_threads(2 if world_size > 1 else 8)
@@ -1245,15 +1368,18 @@ def run_main(args, rank: int, world_size: int, device: torch.device):
         device=str(device),
     )
     seed_everything(cfg.seed + rank)
+    output_dir = Path(args.output_dir).expanduser() if args.output_dir else SCRIPT_DIR
+    if rank == 0:
+        output_dir.mkdir(parents=True, exist_ok=True)
 
     if rank == 0:
         print("=" * 88)
         print(f"[LIF] algorithm dt = physical dt = {cfg.dt_s*1e6:.3f} us")
         print(f"[LIF] beta = exp(-dt/8.7us) = {beta_from_dt(cfg.dt_s):.9f}")
         print(f"[LIF] unified train/val/test steps = {cfg.steps}; window={cfg.steps*cfg.dt_s*1e6:.2f} us")
-        print("[data] using the full OCTMNIST train/val/test splits")
-        print(f"[training] world_size={world_size}; global_batch_size={cfg.batch_size}")
-        print("[target] raw programmed-device SNN: accuracy>=90%, every-class recall>=80%, loss<10")
+        print("[data] official OCTMNIST splits; exact train-image matches excluded from validation only")
+        print(f"[training] experiment={args.experiment}; world_size={world_size}; global_batch_size={cfg.batch_size}")
+        print(f"[target] {args.experiment} SNN: accuracy>=90%, every-class recall>=80%, loss<10")
         print("=" * 88)
 
     if world_size > 1 and rank != 0 and (args.dt_sweep or args.smoke_test or args.eval_only):
@@ -1261,7 +1387,7 @@ def run_main(args, rank: int, world_size: int, device: torch.device):
 
     if args.dt_sweep:
         rows = dt_pilot_sweep(cfg, pilot_epochs=args.pilot_epochs)
-        out = SCRIPT_DIR / "paper_dt_sweep_16steps.csv"
+        out = output_dir / "paper_dt_sweep_16steps.csv"
         with out.open("w", newline="", encoding="utf-8-sig") as f:
             w = csv.writer(f)
             w.writerow(["dt_us", "beta", "steps", "val_acc", "val_min_recall"])
@@ -1279,7 +1405,8 @@ def run_main(args, rank: int, world_size: int, device: torch.device):
     model = OCTMemristorSNN(curve, cfg).to(device)
     train_model = (DDP(model, device_ids=[device.index] if device.type == "cuda" else None)
                    if world_size > 1 and not args.eval_only else model)
-    ckpt_path = SCRIPT_DIR / args.checkpoint
+    ckpt_path = output_dir / args.checkpoint
+    report_ckpt_path = ckpt_path
     nparam = sum(p.numel() for p in model.parameters())
     training_history: list[dict] = []
 
@@ -1295,9 +1422,15 @@ def run_main(args, rank: int, world_size: int, device: torch.device):
         state = torch.load(ckpt_path, map_location=device)
         model.load_state_dict(state["model"])
         model.project_shadow_weights()
-        model.program_all_from_shadow()
-        model.set_weight_mode("programmed")
-        print(f"[checkpoint] loaded + reprogrammed {ckpt_path.name} ({state.get('epoch_tag','unknown')})")
+        if args.experiment == "measured":
+            model.program_all_from_shadow()
+            final_weight_mode = "programmed"
+        elif args.experiment == "ideal":
+            final_weight_mode = "ideal"
+        else:
+            final_weight_mode = "continuous"
+        model.set_weight_mode(final_weight_mode)
+        print(f"[checkpoint] loaded {ckpt_path.name} ({state.get('epoch_tag','unknown')})")
     else:
         # ------------------------------------------------------------------
         # Stage A: continuous SNN, but the actual trainable variable is DeltaG in siemens.
@@ -1310,14 +1443,18 @@ def run_main(args, rank: int, world_size: int, device: torch.device):
             opt, lr_lambda=lambda ep: 0.08 + 0.92 * 0.5 * (1.0 + math.cos(math.pi * ep / max(cfg.warmup_epochs, 1)))
         )
         best_shadow_score = -1.0
-        shadow_path = SCRIPT_DIR / "paper_continuous_shadow_best.pt"
+        shadow_path = (Path(args.base_checkpoint).expanduser().resolve() if args.base_checkpoint
+                       else output_dir / "paper_continuous_shadow_best.pt")
+        last_val = None
 
-        for ep in range(1, cfg.warmup_epochs + 1):
+        for ep in range(1, cfg.warmup_epochs + 1) if not args.base_checkpoint else ():
             loss, tracc, rates = train_epoch(model, train_model, train_loader, opt, cfg, device,
-                                             qat=False, epoch=ep, rank=rank, world_size=world_size)
+                                             weight_mode="continuous", epoch=ep,
+                                             rank=rank, world_size=world_size)
             if rank == 0:
                 model.set_weight_mode("continuous")
                 val = evaluate(model, val_loader, device, cfg.steps, tta_flip=False)
+                last_val = val
                 score = selection_score(val)
                 print(
                     f"[continuous {ep:02d}] loss={loss:.4f} train={100*tracc:.2f}% "
@@ -1338,128 +1475,208 @@ def run_main(args, rank: int, world_size: int, device: torch.device):
             if world_size > 1:
                 dist.barrier()
 
+        if args.experiment == "baseline":
+            if rank == 0:
+                if last_val is None:
+                    raise RuntimeError("The baseline trained no epochs")
+                # Branches must start from the identical END-of-epoch-70 weights,
+                # not from the best earlier validation epoch.
+                base_path = output_dir / "base_epoch_70.pt"
+                save_ckpt(base_path, model, cfg, f"continuous-{cfg.warmup_epochs}-last", last_val)
+                save_training_and_lif_history(training_history, output_dir)
+            if world_size > 1:
+                dist.barrier()
+            if rank == 0:
+                report_final_outputs(model, curve, cfg, args, output_dir, base_path,
+                                     train_ds, val_ds, train_loader, val_loader, test_loader,
+                                     device, "continuous")
+            return
+
+        if args.base_checkpoint:
+            if not shadow_path.is_file():
+                raise FileNotFoundError(f"Baseline checkpoint not found: {shadow_path}")
+            baseline_history_path = shadow_path.parent / "paper_training_history_all.csv"
+            if rank == 0:
+                if not baseline_history_path.is_file():
+                    raise FileNotFoundError(f"Baseline epoch history not found: {baseline_history_path}")
+                with baseline_history_path.open(newline="", encoding="utf-8-sig") as stream:
+                    training_history = list(csv.DictReader(stream))
+                if len(training_history) != cfg.warmup_epochs:
+                    raise ValueError("Baseline history length does not match --warmup-epochs")
+                for row in training_history:
+                    for name in LIF_LAYER_NAMES:
+                        key = f"rate_{name}"
+                        row[key] = float(row[key])
+
         shadow = torch.load(shadow_path, map_location=device)
+        if args.base_checkpoint:
+            saved_cfg = shadow.get("config", {})
+            if (shadow.get("epoch_tag") != f"continuous-{cfg.warmup_epochs}-last"
+                    or saved_cfg.get("seed") != cfg.seed
+                    or saved_cfg.get("steps") != cfg.steps
+                    or abs(float(saved_cfg.get("dt_s", -1)) - cfg.dt_s) > 1e-15):
+                raise ValueError("Baseline checkpoint seed, epoch, steps or dt do not match this branch")
         model.load_state_dict(shadow["model"])
         model.project_shadow_weights()
         if rank == 0:
-            print(f"[continuous] loaded best {shadow['epoch_tag']}")
+            print(f"[continuous] loaded shared final baseline {shadow['epoch_tag']}")
 
-        # Exact nearest-measured-state mapping, followed by programmed-device validation.
-        if rank == 0:
-            mean_qerr, max_qerr = model.quantization_stats()
-            print(
-                f"[mapping] before programming: mean |DeltaGq-DeltaG|/range={mean_qerr:.3e}, "
-                f"max={max_qerr:.3e}"
+        if args.experiment == "float":
+            model.set_weight_mode("continuous")
+            # All branches restart an AdamW optimizer at epoch 71 with the same
+            # continuation LR/schedule; only their forward weight map differs.
+            opt = build_optimizer(model, cfg.device_lr, cfg.weight_decay * 0.5)
+            sch = torch.optim.lr_scheduler.LambdaLR(
+                opt, lr_lambda=lambda ep: 0.10 + 0.90 * 0.5 *
+                (1.0 + math.cos(math.pi * ep / max(cfg.device_epochs, 1)))
             )
-        model.program_all_from_shadow()
-        model.set_weight_mode("programmed")
-        if rank == 0:
-            preqat = evaluate(model, val_loader, device, cfg.steps, tta_flip=False)
-            print_metrics("VAL after exact measured-state mapping", preqat)
-        if world_size > 1:
-            dist.barrier()
-
-        # ------------------------------------------------------------------
-        # Stage B: measured-state QAT. Forward uses the same discrete state table as programming.
-        # ------------------------------------------------------------------
-        model.set_weight_mode("qat")
-        opt = build_optimizer(model, cfg.device_lr, cfg.weight_decay * 0.5)
-        total_dev = cfg.device_epochs + cfg.extra_device_epochs
-        sch = torch.optim.lr_scheduler.LambdaLR(
-            opt, lr_lambda=lambda ep: 0.10 + 0.90 * 0.5 * (1.0 + math.cos(math.pi * ep / max(total_dev, 1)))
-        )
-        best_score = -1.0
-        stale = 0
-        targets_reached_on_val = False
-
-        for dep in range(1, total_dev + 1):
-            loss, tracc, rates = train_epoch(model, train_model, train_loader, opt, cfg, device,
-                                             qat=True, epoch=cfg.warmup_epochs + dep,
-                                             rank=rank, world_size=world_size)
-            stop = torch.zeros(1, dtype=torch.int32, device=device)
-            if rank == 0:
-                model.set_weight_mode("qat")
-                val = evaluate(model, val_loader, device, cfg.steps, tta_flip=False)
-                score = selection_score(val)
-                reached = val["acc"] >= cfg.target_acc and val["min_recall"] >= cfg.target_min_recall
-                print(
-                    f"[QAT {dep:02d}] loss={loss:.4f} train={100*tracc:.2f}% "
-                    f"val={100*val['acc']:.2f}% minR={100*val['min_recall']:.2f}% "
-                    f"macroF1={100*val['macro_f1']:.2f}% score={score:.4f} rates={np.round(rates,3)}"
+            best_score = -1.0
+            targets_reached_on_val = False
+            for dep in range(1, cfg.device_epochs + 1):
+                loss, tracc, rates = train_epoch(
+                    model, train_model, train_loader, opt, cfg, device,
+                    weight_mode="continuous", epoch=cfg.warmup_epochs + dep,
+                    rank=rank, world_size=world_size,
                 )
-                training_history.append(make_training_history_row(
-                    stage="Stage_B_measured_state_QAT",
-                    weight_mode="mapped_physical_device",
-                    stage_epoch=dep, global_epoch=cfg.warmup_epochs + dep,
-                    train_loss=loss, train_acc=tracc, val=val, score=score,
-                    lr=max(pg["lr"] for pg in opt.param_groups), rates=rates, pulse_budget=0,
-                ))
-
-                if score > best_score + 1e-4:
-                    best_score = score
-                    stale = 0
-                    save_ckpt(ckpt_path, model, cfg, f"QAT-{dep}", val)
-                    print(f"[checkpoint] best measured-state QAT SNN -> {ckpt_path.name}")
-                else:
-                    stale += 1
-
-                if reached:
-                    targets_reached_on_val = True
-                    if stale >= 3:
-                        print("[early-stop] >=90% validation target reached stably")
-                        stop.fill_(1)
-                elif dep >= cfg.device_epochs and stale >= cfg.device_patience:
-                    print("[stop] QAT validation plateau; test labels remain untouched")
-                    stop.fill_(1)
-            sch.step()
+                if rank == 0:
+                    val = evaluate(model, val_loader, device, cfg.steps, tta_flip=False)
+                    score = selection_score(val)
+                    print(
+                        f"[float continuation {dep:02d}] loss={loss:.4f} "
+                        f"train={100*tracc:.2f}% val={100*val['acc']:.2f}% "
+                        f"minR={100*val['min_recall']:.2f}% "
+                        f"macroF1={100*val['macro_f1']:.2f}% score={score:.4f}"
+                    )
+                    training_history.append(make_training_history_row(
+                        stage="Stage_B_float_continuation", weight_mode="ideal_float_shadow",
+                        stage_epoch=dep, global_epoch=cfg.warmup_epochs + dep,
+                        train_loss=loss, train_acc=tracc, val=val, score=score,
+                        lr=max(pg["lr"] for pg in opt.param_groups), rates=rates, pulse_budget=0,
+                    ))
+                    if score > best_score + 1e-4:
+                        best_score = score
+                        save_ckpt(ckpt_path, model, cfg, f"float-continuation-{dep}", val)
+                    if val["acc"] >= cfg.target_acc and val["min_recall"] >= cfg.target_min_recall:
+                        targets_reached_on_val = True
+                sch.step()
+                if world_size > 1:
+                    dist.barrier()
             if world_size > 1:
-                dist.broadcast(stop, src=0)
-            if stop.item():
-                break
+                dist.barrier()
+            if not ckpt_path.exists():
+                raise RuntimeError("No float-continuation checkpoint was saved")
+            state = torch.load(ckpt_path, map_location=device)
+            model.load_state_dict(state["model"])
+            model.project_shadow_weights()
+            final_weight_mode = "continuous"
+        else:
+            quantizer = "ideal" if args.experiment == "ideal" else "measured"
+            qat_mode = "ideal_qat" if args.experiment == "ideal" else "qat"
+            final_weight_mode = "ideal" if args.experiment == "ideal" else "programmed"
+            history_mode = "ideal_uniform_quantized" if args.experiment == "ideal" else "mapped_physical_device"
+            stage_name = "Stage_B_ideal_uniform_QAT" if args.experiment == "ideal" else "Stage_B_measured_state_QAT"
 
-        if world_size > 1:
-            dist.barrier()
-        if not ckpt_path.exists():
-            raise RuntimeError("No QAT checkpoint was saved")
-
-        state = torch.load(ckpt_path, map_location=device)
-        model.load_state_dict(state["model"])
-        model.project_shadow_weights()
-        model.program_all_from_shadow()
-        model.set_weight_mode("programmed")
-        if rank == 0:
-            print(f"[checkpoint] loaded and physically mapped best {state['epoch_tag']}")
-
-        if rank == 0:
-            model.set_weight_mode("qat")
-            q_probe, _ = collect_logits(model, val_loader, device, cfg.steps, tta_flip=False)
-            model.set_weight_mode("programmed")
-            p_probe, _ = collect_logits(model, val_loader, device, cfg.steps, tta_flip=False)
-            qp_diff = float((q_probe - p_probe).abs().max())
-            print(f"[mapping-check] max |QAT logits - programmed logits| = {qp_diff:.3e}")
-
-            if not targets_reached_on_val:
+            if rank == 0:
+                mean_qerr, max_qerr = model.quantization_stats(quantizer)
                 print(
-                    "[warning] 90% validation target was not demonstrated in this run. "
-                    "The code will not tune on test labels to fake the requested number."
+                    f"[{quantizer}-mapping] mean |DeltaGq-DeltaG|/range={mean_qerr:.3e}, "
+                    f"max={max_qerr:.3e}"
                 )
-            save_training_and_lif_history(training_history)
+                model.set_weight_mode("ideal" if args.experiment == "ideal" else "qat")
+                preqat = evaluate(model, val_loader, device, cfg.steps, tta_flip=False)
+                print_metrics(f"VAL after {quantizer} quantization", preqat)
+            if world_size > 1:
+                dist.barrier()
+
+            model.set_weight_mode(qat_mode)
+            opt = build_optimizer(model, cfg.device_lr, cfg.weight_decay * 0.5)
+            total_dev = cfg.device_epochs + cfg.extra_device_epochs
+            sch = torch.optim.lr_scheduler.LambdaLR(
+                opt, lr_lambda=lambda ep: 0.10 + 0.90 * 0.5 * (1.0 + math.cos(math.pi * ep / max(total_dev, 1)))
+            )
+            best_score = -1.0
+            stale = 0
+            targets_reached_on_val = False
+
+            for dep in range(1, total_dev + 1):
+                loss, tracc, rates = train_epoch(
+                    model, train_model, train_loader, opt, cfg, device,
+                    weight_mode=qat_mode, epoch=cfg.warmup_epochs + dep,
+                    rank=rank, world_size=world_size,
+                )
+                stop = torch.zeros(1, dtype=torch.int32, device=device)
+                if rank == 0:
+                    model.set_weight_mode(qat_mode)
+                    val = evaluate(model, val_loader, device, cfg.steps, tta_flip=False)
+                    score = selection_score(val)
+                    reached = val["acc"] >= cfg.target_acc and val["min_recall"] >= cfg.target_min_recall
+                    print(
+                        f"[{args.experiment} QAT {dep:02d}] loss={loss:.4f} train={100*tracc:.2f}% "
+                        f"val={100*val['acc']:.2f}% minR={100*val['min_recall']:.2f}% "
+                        f"macroF1={100*val['macro_f1']:.2f}% score={score:.4f} rates={np.round(rates,3)}"
+                    )
+                    training_history.append(make_training_history_row(
+                        stage=stage_name, weight_mode=history_mode,
+                        stage_epoch=dep, global_epoch=cfg.warmup_epochs + dep,
+                        train_loss=loss, train_acc=tracc, val=val, score=score,
+                        lr=max(pg["lr"] for pg in opt.param_groups), rates=rates, pulse_budget=0,
+                    ))
+                    if score > best_score + 1e-4:
+                        best_score = score
+                        stale = 0
+                        save_ckpt(ckpt_path, model, cfg, f"{args.experiment}-QAT-{dep}", val)
+                    else:
+                        stale += 1
+                    if reached:
+                        targets_reached_on_val = True
+                    if args.early_stop:
+                        if reached and stale >= 3:
+                            stop.fill_(1)
+                        elif dep >= cfg.device_epochs and stale >= cfg.device_patience:
+                            stop.fill_(1)
+                sch.step()
+                if world_size > 1:
+                    dist.broadcast(stop, src=0)
+                if stop.item():
+                    break
+
+            if world_size > 1:
+                dist.barrier()
+            if not ckpt_path.exists():
+                raise RuntimeError("No quantized checkpoint was saved")
+            state = torch.load(ckpt_path, map_location=device)
+            model.load_state_dict(state["model"])
+            model.project_shadow_weights()
+            if args.experiment == "measured":
+                model.program_all_from_shadow()
+                if rank == 0:
+                    programmed_state = dict(state)
+                    programmed_state["model"] = model.state_dict()
+                    programmed_state["epoch_tag"] = str(state.get("epoch_tag", "measured")) + "-programmed"
+                    report_ckpt_path = output_dir / "programmed.pt"
+                    torch.save(programmed_state, report_ckpt_path)
+            model.set_weight_mode(final_weight_mode)
+
+        if rank == 0:
+            if not targets_reached_on_val:
+                print("[warning] validation targets were not demonstrated; test labels were not used for tuning")
+            save_training_and_lif_history(training_history, output_dir)
         if world_size > 1:
             dist.barrier()
 
     # ----------------------------------------------------------------------
-    # PRIMARY FINAL RESULTS: raw, one-pass, programmed-device SNN, exactly 16 steps.
+    # PRIMARY FINAL RESULTS: raw, one-pass SNN for the selected weight condition, 16 steps.
     # ----------------------------------------------------------------------
     if world_size > 1 and rank != 0:
         return
-    model.set_weight_mode("programmed")
+    model.set_weight_mode(final_weight_mode)
     val_logits, val_y = collect_logits(model, val_loader, device, cfg.steps, tta_flip=False)
     val_final = metrics_from_logits(val_logits, val_y, calibration=None)
-    print_metrics("VAL-final RAW PHYSICAL 16-step", val_final)
+    print_metrics(f"VAL-final {args.experiment} 16-step", val_final)
 
     test_logits, test_y = collect_logits(model, test_loader, device, cfg.steps, tta_flip=False)
     test_final = metrics_from_logits(test_logits, test_y, calibration=None)
-    print_metrics("TEST RAW PHYSICAL 16-step", test_final)
+    print_metrics(f"TEST {args.experiment} 16-step", test_final)
 
     train_eval_loader = DataLoader(
         train_ds, batch_size=cfg.eval_batch_size, shuffle=False,
@@ -1467,13 +1684,13 @@ def run_main(args, rank: int, world_size: int, device: torch.device):
     )
     train_logits, train_y = collect_logits(model, train_eval_loader, device, cfg.steps, tta_flip=False)
     train_final = metrics_from_logits(train_logits, train_y, calibration=None)
-    print_metrics("TRAIN-final RAW PHYSICAL 16-step", train_final)
+    print_metrics(f"TRAIN-final {args.experiment} 16-step", train_final)
 
-    save_confusion_matrix_csv(SCRIPT_DIR / "paper_confusion_matrix_train.csv", train_final)
-    save_confusion_matrix_csv(SCRIPT_DIR / "paper_confusion_matrix_validation.csv", val_final)
-    save_confusion_matrix_csv(SCRIPT_DIR / "paper_confusion_matrix_test.csv", test_final)
+    save_confusion_matrix_csv(output_dir / "paper_confusion_matrix_train.csv", train_final)
+    save_confusion_matrix_csv(output_dir / "paper_confusion_matrix_validation.csv", val_final)
+    save_confusion_matrix_csv(output_dir / "paper_confusion_matrix_test.csv", test_final)
     save_final_split_metrics_csv(
-        SCRIPT_DIR / "paper_final_split_metrics.csv",
+        output_dir / "paper_final_split_metrics.csv",
         [("train", train_final), ("validation", val_final), ("test", test_final)]
     )
 
@@ -1481,8 +1698,9 @@ def run_main(args, rank: int, world_size: int, device: torch.device):
         tta = evaluate(model, test_loader, device, cfg.steps, tta_flip=True)
         print_metrics("TEST supplementary flip-TTA", tta)
 
-    p_ltp, p_ltd = model.pulse_counts()
-    print(f"[device] canonical programming pulse events: LTP={p_ltp:,}, LTD={p_ltd:,}")
+    if args.experiment == "measured":
+        p_ltp, p_ltd = model.pulse_counts()
+        print(f"[device] canonical programming pulse events: LTP={p_ltp:,}, LTD={p_ltd:,}")
 
     passed = (
         test_final["acc"] >= cfg.target_acc and
@@ -1490,23 +1708,25 @@ def run_main(args, rank: int, world_size: int, device: torch.device):
         test_final["loss"] < 10.0
     )
     print(
-        f"[target] raw physical accuracy>=90%, every-class recall>=80%, loss<10: "
+        f"[target] {args.experiment} accuracy>=90%, every-class recall>=80%, loss<10: "
         f"{'PASS' if passed else 'NOT REACHED'}"
     )
 
-    out_meta = SCRIPT_DIR / "paper_final_metadata.pt"
+    out_meta = output_dir / "paper_final_metadata.pt"
     torch.save(dict(
-        checkpoint=str(ckpt_path.name), config=asdict(cfg),
+        checkpoint=str(report_ckpt_path.name), experiment=args.experiment, config=asdict(cfg),
         test_acc=test_final["acc"], test_loss=test_final["loss"],
         test_recall=test_final["recall"], test_cm=test_final["cm"], passed=passed,
         device_g_min=curve.g_min, device_g_max=curve.g_max,
         differential_delta_min=curve.delta_min, differential_delta_max=curve.delta_max,
+        ideal_uniform_levels=curve.ideal_levels,
+        measured_ordered_pair_states=int(curve.diff_values.numel()),
     ), out_meta)
 
     if not args.no_plots:
-        plot_device(curve, SCRIPT_DIR / "paper_device_curves.png")
+        plot_device(curve, output_dir / "paper_device_curves.png")
         identity_calibration = (1.0, torch.zeros(N_CLASSES))
-        plot_receptive_fields(model, val_ds, device, cfg, identity_calibration, SCRIPT_DIR / "new2.png")
+        plot_receptive_fields(model, val_ds, device, cfg, identity_calibration, output_dir / "new2.png")
 
 
 def main():

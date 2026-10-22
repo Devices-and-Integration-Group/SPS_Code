@@ -1,3 +1,6 @@
-numpy
-torch
+# Versions recorded by the completed results/ablation run manifests.
+numpy==2.3.5
+# The completed GPU runs used 2.8.0+cu128; select the matching CUDA wheel separately.
+torch==2.8.0
+# Optional plots in main.py import Matplotlib; its exact run-time version was not recorded.
 matplotlib
